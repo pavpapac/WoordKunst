@@ -57,135 +57,185 @@ function writeString(view: DataView, offset: number, string: string): void {
 }
 
 
-// --- Main Service Function ---
+// --- Main Service Functions ---
+
+export interface TranslationPair {
+    original: string;
+    translated: string;
+}
+
+export interface QuizQuestion {
+    question: string;
+    options: string[];
+    correctAnswer: string;
+}
 
 export interface CreativeContent {
-    translations: { original: string; translated: string; }[];
+    translations: TranslationPair[];
     story: string;
     imageUrl: string;
     audioUrl: string;
+    comprehensionQuestions?: QuizQuestion[];
 }
 
+/**
+ * Mode 1: Words -> Story, Comic, Podcast, Vocabulary Quiz
+ */
 export const generateCreativeContent = async (
     inputWords: string,
     inputLanguage: string,
     translationLanguage: string,
     isBeginner: boolean,
 ): Promise<CreativeContent> => {
-    const originalWords = inputWords.split(',').map(word => word.trim());
-    
-    // 1. Translate Words
-    let translatedWords: string[];
-    try {
-        const translateResponse = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: `Translate these words from ${inputLanguage} to ${translationLanguage}: ${inputWords}`,
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: Type.ARRAY,
-                    items: {
-                        type: Type.STRING,
-                        description: "A single translated word."
-                    }
-                }
-            }
-        });
-        translatedWords = JSON.parse(translateResponse.text);
-        if (!translatedWords || translatedWords.length === 0) {
-            throw new Error("Translation returned no words.");
-        }
-    } catch (error) {
-        console.error("Error during translation:", error);
-        throw new Error("Step 1/4: Failed to translate the words. The model may have had trouble understanding the input.");
+    const originalWords = inputWords
+        .split(/[,\s]+/)
+        .map(word => word.trim())
+        .filter(word => word.length > 0);
+
+    if (originalWords.length === 0) {
+        throw new Error("No valid words detected.");
     }
     
+    // 1. Translate Words
+    const translateResponse = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Translate these words individually from ${inputLanguage} to ${translationLanguage}: ${originalWords.join(', ')}`,
+        config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
+            }
+        }
+    });
+    const translatedWords = JSON.parse(translateResponse.text);
     const translations = originalWords.map((original, index) => ({
-        original: original,
+        original,
         translated: translatedWords[index] || "Translation not found"
     }));
 
-    // Determine words to use for the story. Story is always in Dutch.
-    const storyLanguage = "Dutch";
-    let wordsForStory: string[];
-
-    if (inputLanguage === 'Dutch') {
-        // If input is Dutch, use the original words for the Dutch story.
-        wordsForStory = originalWords;
-    } else {
-        // If input is English, use the translated (Dutch) words for the Dutch story.
-        wordsForStory = translatedWords;
-    }
-
-
     // 2. Generate Story
-    let story: string;
-    try {
-        const storyPrompt = isBeginner
-            ? `Write a simple story in ${storyLanguage} for a beginner language learner. The story should be about one paragraph long and easy to understand. It must include the following words: ${wordsForStory.join(', ')}.`
-            : `Write a short, fun, simple story in ${storyLanguage} for a language learner. The story must include the following words: ${wordsForStory.join(', ')}.`;
+    const storyLanguage = "Dutch";
+    const wordsForStory = inputLanguage === 'Dutch' ? originalWords : translatedWords;
+    const storyPrompt = isBeginner
+        ? `Write a simple, 1-paragraph story in ${storyLanguage} for a beginner. Use these words: ${wordsForStory.join(', ')}.`
+        : `Write a fun, short story in ${storyLanguage}. Include these words: ${wordsForStory.join(', ')}.`;
 
-        const storyResponse = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: storyPrompt,
-        });
-        story = storyResponse.text;
-        if (!story) {
-            throw new Error("Story generation returned empty content.");
-        }
-    } catch (error) {
-        console.error("Error during story generation:", error);
-        throw new Error(`Step 2/4: Failed to generate a story with the translated words. Please try a different set of words.`);
-    }
+    const storyResponse = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: storyPrompt,
+    });
+    const story = storyResponse.text;
 
     // 3. Generate Image
-    let imageUrl: string;
-    try {
-        const imageResponse = await ai.models.generateImages({
-            model: 'imagen-4.0-generate-001',
-            prompt: `A fun, vibrant, simple comic book panel illustrating this short story: "${story}"`,
-            config: {
-                numberOfImages: 1,
-                aspectRatio: '16:9',
-                outputMimeType: 'image/jpeg',
-            },
-        });
-        const base64Image = imageResponse.generatedImages[0]?.image.imageBytes;
-        if (!base64Image) {
-            throw new Error("Image generation returned no image data.");
+    const imageResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image',
+        contents: { parts: [{ text: `A vibrant, clear digital illustration of this story: "${story}"` }] },
+        config: { imageConfig: { aspectRatio: "16:9" } },
+    });
+    let imageUrl = "";
+    for (const part of imageResponse.candidates[0].content.parts) {
+        if (part.inlineData) {
+            imageUrl = `data:image/png;base64,${part.inlineData.data}`;
+            break;
         }
-        imageUrl = `data:image/jpeg;base64,${base64Image}`;
-    } catch (error) {
-        console.error("Error during image generation:", error);
-        throw new Error("Step 3/4: Failed to create the comic image from the story.");
     }
 
-    // 4. Generate Podcast (TTS)
-    let audioUrl: string;
-    try {
-        const ttsPrompt = isBeginner
-            ? `Read the following text clearly and at a slightly slower pace for a language learner: ${story}`
-            : story;
-
-        const ttsResponse = await ai.models.generateContent({
-            model: "gemini-2.5-flash-preview-tts",
-            contents: [{ parts: [{ text: ttsPrompt }] }],
-            config: {
-                responseModalities: [Modality.AUDIO],
-            },
-        });
-        const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        if (!base64Audio) {
-            throw new Error("Podcast generation returned no audio data.");
-        }
-        
-        const pcmData = decode(base64Audio);
-        const wavBlob = createWavBlob(pcmData);
-        audioUrl = URL.createObjectURL(wavBlob);
-    } catch (error) {
-        console.error("Error during podcast generation:", error);
-        throw new Error("Step 4/4: Failed to generate the podcast audio for the story.");
-    }
+    // 4. Generate Audio
+    const ttsResponse = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text: isBeginner ? `Read clearly and slowly: ${story}` : story }] }],
+        config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } }
+        },
+    });
+    const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const audioUrl = base64Audio ? URL.createObjectURL(createWavBlob(decode(base64Audio))) : "";
 
     return { translations, story, imageUrl, audioUrl };
+};
+
+/**
+ * Mode 2: Full Story -> Glossary, Comic, Podcast, Comprehension Quiz
+ */
+export const generateStoryAnalysis = async (
+    userStory: string,
+    isBeginner: boolean
+): Promise<CreativeContent> => {
+    // 1. Generate Glossary & Comprehension Quiz
+    const analysisResponse = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Analyze this Dutch story: "${userStory}". 
+        1. Extract 6 difficult or important Dutch words/phrases and translate them to English.
+        2. Create 4 multiple-choice comprehension questions in English about the story's content.`,
+        config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                    glossary: {
+                        type: Type.ARRAY,
+                        items: {
+                            type: Type.OBJECT,
+                            properties: {
+                                original: { type: Type.STRING, description: "The Dutch word" },
+                                translated: { type: Type.STRING, description: "The English translation" }
+                            },
+                            required: ["original", "translated"]
+                        }
+                    },
+                    questions: {
+                        type: Type.ARRAY,
+                        items: {
+                            type: Type.OBJECT,
+                            properties: {
+                                question: { type: Type.STRING },
+                                options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                                correctAnswer: { type: Type.STRING }
+                            },
+                            required: ["question", "options", "correctAnswer"]
+                        }
+                    }
+                },
+                required: ["glossary", "questions"]
+            }
+        }
+    });
+
+    const analysis = JSON.parse(analysisResponse.text);
+
+    // 2. Generate Image
+    const imageResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image',
+        contents: { parts: [{ text: `A clear, descriptive storytelling illustration for this text: "${userStory}"` }] },
+        config: { imageConfig: { aspectRatio: "16:9" } },
+    });
+    let imageUrl = "";
+    for (const part of imageResponse.candidates[0].content.parts) {
+        if (part.inlineData) {
+            imageUrl = `data:image/png;base64,${part.inlineData.data}`;
+            break;
+        }
+    }
+
+    // 3. Generate Audio
+    const ttsResponse = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text: isBeginner ? `Read slowly: ${userStory}` : userStory }] }],
+        config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } }
+        },
+    });
+    const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const audioUrl = base64Audio ? URL.createObjectURL(createWavBlob(decode(base64Audio))) : "";
+
+    return {
+        translations: analysis.glossary,
+        story: userStory,
+        imageUrl,
+        audioUrl,
+        comprehensionQuestions: analysis.questions
+    };
 };
